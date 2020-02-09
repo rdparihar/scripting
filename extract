@@ -1,0 +1,314 @@
+
+"""
+   This script will get the status of lastest snapshot deployed to VAL, STAGER and PROD 
+   for a perticualr fix 
+   - to get the status of snapshot, need enviornment ID and snapshot id 
+   -  Application Name  = Unique
+   -  Snapshot ID  = unique, name can be same 
+ 
+
+   - **********************************************************************************
+   - Modification History
+   - Date        Developer    Purpose
+   - ----------------------------------------------------------------------------------
+   - 01/27/2020  Rajdeep  New script created 
+
+"""
+ 
+# --- Import Python modules
+import os
+import getopt
+import getpass
+import sys
+import json
+import requests
+import datetime
+import time
+import collections
+
+# --- Import release engineering modules
+import reCommon
+import reMessage
+import reProperty
+import ucCommon
+
+#script specific imports
+import warnings
+import re
+
+from time import gmtime, strftime
+from requests.auth import HTTPBasicAuth
+from collections import defaultdict
+
+# --- Start Required task specific constants / variables 
+gDataDir = "data"                       # Meta data folder
+gLogDir = "log"                         # Log folder
+gOutputDir = "out"                      # Output folder
+
+
+# --- Declearation of the keys for dict 
+gTaskID = "EXTRACT_SNAPSHOT"		# ID in Task JSON file
+gOutputPrefix = "jira_snapshot"       # Output file name prefix
+gCmdParam = {}   # Command Line Parameters with values - <long option> : <value>
+gFailMsg = "***Processing failed with errors***"
+gSuccessMsg = "***Processing completed successfully***"
+
+gUCurl = "https://urbancode.trinet.com/{0}"
+gUCApplications = ['PassPort','Micro Services']
+gUCEnviornments = ['val01br','stg01br','prd01au']
+gUCEnviornments1 = {'val01br': 'VAL', 'stg01br': 'STAGER', 'prd01au' : 'PROD'}
+gExtractedData = []
+gNonStdSnap = []
+proxies = {
+  "http": None,
+  "https": None,
+}
+gStdSnap = True
+gSnapId = {}
+
+def validateCmdParam(argv, webEnv, logFp):
+   """
+   Collect input param and validate
+
+   Arguments:
+      argv   - Command line param
+      webEnv -  True: UI, False: command line
+      logFp  -  Log file handler
+   """
+   global gCmdParam
+   allParam, gCmdParam = reCommon.getCmdParam(argv, gTaskID, logFp, webEnv)
+
+   # If there is any additional param validation do it here
+   reCommon.writeCmdParamLog(allParam, gCmdParam, logFp)
+
+
+def getMatchingSnapshots(logFp,appName,fixversion):
+    urlData = "cli/application/snapshotsInApplication?application="+appName+"&maxResults=1000"
+    msg = ""
+    status, data, msg =ucCommon.getUCData(urlData,logFp)
+    rsnapShotList=[]
+    rsnapdict ={}   
+    snapShotName = "Release-"+fixversion            
+    snapShotpattern = re.compile("^"+snapShotName+"+")
+    if status == 200:
+      for idx, data in enumerate(data):
+          ucsnapshot = dict(data)
+          if (snapShotpattern.match(ucsnapshot["name"])):  
+              rsnapShotList.append(ucsnapshot["name"])
+      return rsnapShotList
+     
+            #print(ucsnapshot["name"])
+    return 0
+
+
+
+
+def getLatestSnapshot(logFp,appName,fixversion):
+    latestSnap = None
+    latestSnapId = 0
+    
+    mtchSnp = getMatchingSnapshots(logFp,appName,fixversion)
+    
+    dictA = {}
+    dictB = {}
+    snapShotName = "Release-"+fixversion
+    snapShotpattern = snapShotName
+
+    def maxItem(dicts):
+      for id, data in dicts.items(): 
+          return id, max(data)    
+
+    def validateSnap(snap):
+      regex = r"^Release-M\.[0-9]{4}\.[0-1][0-9]\.[0][1-2]\.([\w+-]+|[\w\-]+\.[0-9])$"
+      snap_str = snap
+      if bool(re.match(regex, snap_str)) == True:
+        return 0
+      return 1
+    if mtchSnp:
+
+      for snap in mtchSnp:
+        if validateSnap(snap)== 0:
+
+          var_part = re.split(snapShotpattern, snap)[1:][0]
+          varStriped = var_part.strip('.')
+          fix_part = snapShotName
+          if varStriped.isdigit():
+             dictA.setdefault(fix_part, set()).add(int(varStriped))
+          else:
+             var_a = var_part.split('.')[-1:][0]
+
+             if var_a.isdigit():
+               var_b = var_part.split('.')[-2:][0]
+               dictB.setdefault(var_b, set()).add(int(var_a))
+             else:
+               dictB.setdefault(var_a, set()).add(0)
+            
+      #print(fix_part, var_part, dictA, dictB)
+      lsnap = []
+      lsnap.append(maxItem(dictA)[0]+"."+str(maxItem(dictA)[1]))
+      if dictB:
+           if maxItem(dictB)[1] == 0:
+              partb = maxItem(dictB)[0]
+           else:
+              partb = maxItem(dictB)[0]+"."+str(maxItem(dictB)[1])
+           lsnap.append(maxItem(dictA)[0]+"."+partb)
+      return lsnap
+    #  latestSnapId=gSnapId.get(latestSnap)
+
+   #   msg = "Latest snapshot for "+ appName + " is "  + latestSnap
+  #    print (msg)
+#      reMessage.writeLog(logFp, msg)
+ #     appName = None
+ #     gNonStdSnap.clear()
+#      return latestSnapId
+
+
+def getEnvironmentsInApp(logFp,appName): 
+  envDict = {}
+  msg = ""
+  urlData = "cli/application/environmentsInApplication?application="+appName+""
+  status, data, msg = ucCommon.getUCData(urlData, logFp)
+  if status == 200:                                     # Status will alway be HTTP:200 it should be even of 0:[] records returned 
+    for idx, data in enumerate(data):
+      ucEnv = dict(data)
+      for env in gUCEnviornments1.keys():
+        if env == ucEnv["name"]:
+           envDict[ucEnv["name"]] = ucEnv["id"]         #  {"prd01au": 'acf7b558-d9a6-4d79-bd4c-1f0e6d16848f'} 
+  return envDict
+
+def getSnapshotStatusData(logFp,snapshotId, envId,ap,envKey):
+  statusData = {}
+  urlData = "rest/deploy/applicationProcessRequest/table?orderField=calendarEntry.scheduledDate&sortType=desc&filterFields=environment.id&filterFields=snapshot.id&filterValue_environment.id="+envId+"&filterType_environment.id=eq&filterClass_environment.id=UUID&filterValue_snapshot.id="+snapshotId+"&filterType_snapshot.id=eq&filterClass_snapshot.id=UUID&outputType=BASIC&outputType=LINKED"
+  outPut = {}
+  outPut['snapshot']=""
+  outPut['package_name'] = ap
+  outPut['environment_name'] = envKey
+  outPut['environment'] = gUCEnviornments1.get(envKey)
+  outPut['deployment_date'] = ""
+  outPut['deployment_status'] = ""
+  status, data, msg = ucCommon.getUCData(urlData, logFp)
+  if status == 200:
+    for idx, data in enumerate(data):
+      statusData = dict(data)    
+      if idx == 0:
+        outPut['package_name'] = statusData['application']['name']
+        outPut['environment_name'] = statusData['environment']['name']
+        s = statusData['endTime'] / 1000.0
+        #%B for month name 
+        outPut['snapshot'] = statusData['snapshot']['name']
+        outPut['deployment_date'] = datetime.datetime.fromtimestamp(s).strftime('%Y/%m/%d %H:%M')
+        outPut['deployment_status'] = statusData['result']
+    gExtractedData.append(outPut)   
+  return statusData
+
+def getSnapshotId(logFp,snapshot,app):
+    l_snap_id = ""
+    urlData = "cli/snapshot/getSnapshot?application="+app+"&snapshot="+snapshot+"" 
+    status, data, msg = ucCommon.getUCData(urlData, logFp)
+    if status == 200:                                    
+          ucSnapD = dict(data)
+          l_snap_id = ucSnapD['id']
+          return l_snap_id
+
+
+def extractSnapshotStatus(webEnv, logFp, fpJson ):
+    fixversion = gCmdParam['fixVersion']
+    finD ={}
+    inputDict = {}
+    for app in gUCApplications:
+        inputDict['env'] = getEnvironmentsInApp(logFp,app)
+        #inputDict['snap']= getLatestSnapshot(logFp, app, fixversion)
+        lSnaps= getLatestSnapshot(logFp, app, fixversion)
+        print(lSnaps)
+        snp_ids = []
+        for snp in lSnaps:
+           snp_ids.append(getSnapshotId(logFp, snp, app))
+        inputDict['snap']= snp_ids
+
+        if inputDict['snap'] is not None:
+           finD[app] = inputDict
+    
+           inputDict = {}
+
+    if finD:
+        print (finD)
+
+        print ("\n*********FINAL Status *********")
+        for ap, ap_data in finD.items():
+            snapid = finD[ap]['snap']
+            endi = finD[ap]['env']
+            for envKey, v in endi.items(): 
+                enID = endi[envKey]
+                for snid in snapid:
+                   dat = getSnapshotStatusData(logFp, snid, enID, ap,envKey) 
+        jsonDict = {}
+        jsonDict['data'] = gExtractedData
+        print (json.dumps(jsonDict, indent=2))
+        
+        exportToJson(jsonDict, fpJson)
+
+    else:
+        print("No data")
+
+    return 0
+
+
+
+def exportToJson(jsonData, fpJson):
+  json.dump(jsonData, fpJson, indent=2)
+
+
+def main(argv, webEnv=False):
+   """
+   Main function to extract JIRA information
+
+   Arguments:
+      argv   - Command lime param when the script runs from command line
+             - Input from UI when called by Django
+
+      webEnv - False when the script runs from command line
+             - True  when called by Django
+   """
+   
+   # --- Generic variables required for all the tasks
+   logFp = None
+   context = {}
+   inputDict = {}
+
+   try:
+      # --- Generic script required for all the tasks
+      curUser = getpass.getuser()
+      context = reCommon.initContext()
+      logFp, context["logFile"] = reCommon.createLogFile(webEnv, gOutputPrefix, curUser)
+      validateCmdParam(argv, webEnv, logFp)	# Input param validation / default values
+      
+      # Create report output file
+      fileType = "Report"
+      removeFile = True
+      fileName = gOutputPrefix + ".json"
+      
+      fpJson, fileNameFull, output = reCommon.createOutFile(fileType, fileName, removeFile, logFp)
+      if webEnv:           # Return output file name if processing from UI
+         context["output"].append(output)
+
+      
+      ucCommon.setUCVars(gCmdParam["user"], gCmdParam["password"], logFp)
+      extractSnapshotStatus(webEnv, logFp, fpJson)
+
+
+      # --- End task specific scripts -----------------------
+
+      return reCommon.processSuccess(gSuccessMsg, logFp, context, webEnv)   # Return to Django
+
+   except reMessage.ReException as e:
+      return reCommon.processFailure(e, webEnv, gFailMsg, logFp, context)   # Return to Django
+
+   except Exception as e:           # Unknown exceptions which are not captured 
+      tmpMsg = str(type(e).__name__) + " : " + str(e.args)
+      o = reMessage.ReException(logFp, "E199", tmpMsg)
+      return reCommon.processFailure(o, webEnv, gFailMsg, logFp, context)   # Return to Django
+
+# --- Call the main function only when run from the command line 
+# --- Django will make a call with param collected from the UI
+if __name__ == "__main__":
+   main(sys.argv)
